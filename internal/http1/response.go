@@ -7,6 +7,7 @@ package http1
 import (
 	"bufio"
 	"errors"
+	"fmt"
 	"io"
 	"sort"
 	"strconv"
@@ -17,18 +18,31 @@ import (
 // ServerName est la valeur de l'en-tête Server envoyé dans chaque réponse.
 const ServerName = "serveur-http"
 
+// ErrInvalidHeader : WriteResponse a refusé un en-tête, et rien n'a été écrit.
+var ErrInvalidHeader = errors.New("en-tête de réponse invalide")
+
 // Response est une réponse à envoyer. Headers contient seulement les en-têtes propres à la réponse
 // (ex. Content-Type) : Content-Length, Date, Server et Connection sont ajoutés par WriteResponse.
+// Le corps est soit Body (petit, déjà en mémoire : une page d'erreur, un listing),
+// soit File (lu en continu, pour ne jamais charger un fichier de plusieurs Go en mémoire).
 type Response struct {
 	Status  int
 	Headers map[string]string
 	Body    []byte
+	// File : le corps lu morceau par morceau. Le serveur le ferme après l'envoi (voir server.write).
+	// io.ReadCloser = tout ce qui sait lire (Read) et se fermer (Close), comme un *os.File.
+	File io.ReadCloser
+	Size int64 // nombre d'octets de File à envoyer ; ignoré si File vaut nil
+	// OmitBody : pour HEAD, on envoie les mêmes en-têtes (Content-Length compris) mais pas le corps.
+	OmitBody bool
 }
 
 // statusText : le texte standard de chaque code utilisé (RFC 9110 §15, RFC 6585 §5 pour 431).
 var statusText = map[int]string{
 	200: "OK",
+	301: "Moved Permanently",
 	400: "Bad Request",
+	403: "Forbidden",
 	404: "Not Found",
 	405: "Method Not Allowed",
 	408: "Request Timeout",
@@ -53,8 +67,12 @@ var autoHeaders = map[string]bool{"content-length": true, "date": true, "server"
 // pour que les tests puissent vérifier les octets exacts avec une date fixe.
 // Rend une erreur sans rien écrire si un en-tête est invalide, et l'erreur de w si l'écriture échoue.
 func WriteResponse(w io.Writer, resp *Response, now time.Time) error {
+	length := int64(len(resp.Body))
+	if resp.File != nil {
+		length = resp.Size
+	}
 	headers := map[string]string{
-		"Content-Length": strconv.Itoa(len(resp.Body)),
+		"Content-Length": strconv.FormatInt(length, 10),
 		// Format imposé par la RFC 9110 §5.6.7 (IMF-fixdate), toujours en GMT.
 		// En Go, on décrit un format avec la date de référence « Mon Jan 2 15:04:05 2006 ».
 		"Date":       now.UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT"),
@@ -68,7 +86,8 @@ func WriteResponse(w io.Writer, resp *Response, now time.Time) error {
 		// Sécurité : un CR ou un LF dans un nom ou une valeur permettrait d'écrire de faux en-têtes
 		// ou un faux corps (« response splitting »). On vérifie tout avant d'écrire le moindre octet.
 		if !isToken(name) || !isValidValue(value) {
-			return errors.New("en-tête de réponse invalide : " + name)
+			// %w « enveloppe » ErrInvalidHeader : l'appelant le retrouve avec errors.Is.
+			return fmt.Errorf("%w : %s", ErrInvalidHeader, name)
 		}
 		headers[name] = value
 	}
@@ -93,7 +112,19 @@ func WriteResponse(w io.Writer, resp *Response, now time.Time) error {
 		bw.WriteString(name + ": " + headers[name] + "\r\n")
 	}
 	bw.WriteString("\r\n")
-	bw.Write(resp.Body)
+	switch {
+	case resp.OmitBody:
+		// HEAD : rien après la ligne vide.
+	case resp.File != nil:
+		// io.CopyN copie exactement Size octets par morceaux (32 Kio à la fois), sans tout charger.
+		// Si le fichier a moins d'octets que prévu, CopyN rend io.EOF : on remonte l'erreur pour que
+		// le serveur coupe la connexion, plutôt que de laisser le client attendre des octets qui ne viendront pas.
+		if _, err := io.CopyN(bw, resp.File, resp.Size); err != nil {
+			return err
+		}
+	default:
+		bw.Write(resp.Body)
+	}
 	// Les erreurs des WriteString précédents sont gardées par le bufio.Writer et rendues ici.
 	return bw.Flush()
 }

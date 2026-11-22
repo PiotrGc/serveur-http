@@ -75,7 +75,13 @@ func (s *Server) handleConn(conn net.Conn) {
 		return // erreur réseau (connexion coupée) : impossible de répondre
 	}
 
-	s.write(conn, s.callHandler(req))
+	resp := s.callHandler(req)
+	// RFC 9110 §9.3.2 : HEAD rend exactement les en-têtes de GET, sans le corps.
+	// C'est géré ici une fois pour toutes, plutôt que dans chaque handler.
+	if req.Method == "HEAD" {
+		resp.OmitBody = true
+	}
+	s.write(conn, resp)
 }
 
 // callHandler appelle le handler et transforme un plantage (panic) en réponse 500.
@@ -92,14 +98,26 @@ func (s *Server) callHandler(req *http1.Request) (resp *http1.Response) {
 	return s.Handler(req)
 }
 
-// write envoie la réponse. En cas d'erreur (en-tête invalide), on tente une 500 à la place.
+// write envoie la réponse, puis ferme le fichier qu'elle lisait (s'il y en a un).
+// Si un en-tête est invalide, rien n'a encore été envoyé : on peut répondre 500 à la place.
+// Pour toute autre erreur (client parti, fichier tronqué), une partie est peut-être déjà partie :
+// on n'écrit plus rien, et la connexion sera fermée par handleConn.
 func (s *Server) write(conn net.Conn, resp *http1.Response) {
+	if resp.File != nil {
+		// Fermer le fichier dans tous les cas : sinon chaque requête garderait un descripteur ouvert.
+		defer resp.File.Close()
+	}
 	now := time.Now
 	if s.Now != nil {
 		now = s.Now
 	}
-	if err := http1.WriteResponse(conn, resp, now()); err != nil {
-		log.Printf("écriture de la réponse : %v", err)
+	err := http1.WriteResponse(conn, resp, now())
+	if err == nil {
+		return
+	}
+	log.Printf("écriture de la réponse : %v", err)
+	// errors.Is suit les erreurs « enveloppées » avec %w pour retrouver ErrInvalidHeader.
+	if errors.Is(err, http1.ErrInvalidHeader) {
 		http1.WriteResponse(conn, http1.ErrorResponse(500), now())
 	}
 }

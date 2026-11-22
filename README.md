@@ -7,7 +7,7 @@ Son usage : partager un dossier en lecture seule sur le Wi-Fi pour lire ses PDF 
 ## État
 - [x] **V0.0** : le parser de requêtes (RFC 9112), avec les limites de taille et des refus stricts (400 / 414 / 431 / 501 / 505)
 - [x] **V0.1** : serveur TCP qui répond « Hello », réponses d'erreur, `recover` des handlers, fermeture en douceur (lingering close)
-- [ ] V0.2 : servir un dossier
+- [x] **V0.2** : servir un dossier en lecture seule (fichiers lus en continu, listing HTML, HEAD, 301/403/404/405). Anti-traversée en 3 barrières (`cleanPath`, `filepath.IsLocal`, `os.Root`), listing échappé par `html/template` avec une CSP par empreinte
 - [ ] V0.3 : concurrence et robustesse
 - [ ] V0.4 : keep-alive
 - [ ] V0.5 : gros fichiers et Range
@@ -17,7 +17,7 @@ Son usage : partager un dossier en lecture seule sur le Wi-Fi pour lire ses PDF 
 
 ## Lancer
 ```sh
-go run ./cmd/serveur-http -port 8080
+go run ./cmd/serveur-http -port 8080 -dir ./mon-dossier
 curl -i http://127.0.0.1:8080/
 ```
 
