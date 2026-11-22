@@ -1,0 +1,13 @@
+# Binaires compilés
+*.exe
+/bin/
+
+# Secrets et config locale (aucun secret prévu, mais par sécurité)
+.env
+.env.*
+!.env.example
+
+# Fichiers de test et profils
+*.test
+*.out
+*.prof
