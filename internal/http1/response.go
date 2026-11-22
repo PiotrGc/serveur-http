@@ -1,0 +1,108 @@
+// Écriture des réponses HTTP/1.1 : ligne de statut, en-têtes, ligne vide, corps.
+// Utilisé par : internal/server, pour répondre à chaque requête (y compris les erreurs du parser).
+// Ne gère pas encore le keep-alive (V0.4) ni le chunked (V0.6) : chaque réponse a un
+// Content-Length et se termine par la fermeture de la connexion.
+package http1
+
+import (
+	"bufio"
+	"errors"
+	"io"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// ServerName est la valeur de l'en-tête Server envoyé dans chaque réponse.
+const ServerName = "serveur-http"
+
+// Response est une réponse à envoyer. Headers contient seulement les en-têtes propres à la réponse
+// (ex. Content-Type) : Content-Length, Date, Server et Connection sont ajoutés par WriteResponse.
+type Response struct {
+	Status  int
+	Headers map[string]string
+	Body    []byte
+}
+
+// statusText : le texte standard de chaque code utilisé (RFC 9110 §15, RFC 6585 §5 pour 431).
+var statusText = map[int]string{
+	200: "OK",
+	400: "Bad Request",
+	404: "Not Found",
+	405: "Method Not Allowed",
+	408: "Request Timeout",
+	414: "URI Too Long",
+	431: "Request Header Fields Too Large",
+	500: "Internal Server Error",
+	501: "Not Implemented",
+	505: "HTTP Version Not Supported",
+}
+
+// StatusText rend le texte d'un code (« Not Found » pour 404), ou "" si le code est inconnu.
+func StatusText(code int) string {
+	return statusText[code]
+}
+
+// autoHeaders : les en-têtes que WriteResponse calcule lui-même. S'ils sont dans resp.Headers,
+// ils sont ignorés : un Content-Length faux ferait lire au client trop ou trop peu d'octets.
+var autoHeaders = map[string]bool{"content-length": true, "date": true, "server": true, "connection": true}
+
+// WriteResponse écrit resp en entier dans w.
+// now sert à l'en-tête Date. On le passe en paramètre au lieu d'appeler time.Now() ici,
+// pour que les tests puissent vérifier les octets exacts avec une date fixe.
+// Rend une erreur sans rien écrire si un en-tête est invalide, et l'erreur de w si l'écriture échoue.
+func WriteResponse(w io.Writer, resp *Response, now time.Time) error {
+	headers := map[string]string{
+		"Content-Length": strconv.Itoa(len(resp.Body)),
+		// Format imposé par la RFC 9110 §5.6.7 (IMF-fixdate), toujours en GMT.
+		// En Go, on décrit un format avec la date de référence « Mon Jan 2 15:04:05 2006 ».
+		"Date":       now.UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT"),
+		"Server":     ServerName,
+		"Connection": "close", // RFC 9112 §9.6 : on annonce qu'on ferme après cette réponse
+	}
+	for name, value := range resp.Headers {
+		if autoHeaders[strings.ToLower(name)] {
+			continue
+		}
+		// Sécurité : un CR ou un LF dans un nom ou une valeur permettrait d'écrire de faux en-têtes
+		// ou un faux corps (« response splitting »). On vérifie tout avant d'écrire le moindre octet.
+		if !isToken(name) || !isValidValue(value) {
+			return errors.New("en-tête de réponse invalide : " + name)
+		}
+		headers[name] = value
+	}
+
+	// Tri des noms : l'ordre d'une map Go change à chaque exécution. Trier rend la sortie stable,
+	// donc testable octet par octet.
+	names := make([]string, 0, len(headers))
+	for name := range headers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	// bufio.Writer regroupe les petites écritures en un seul envoi sur la socket.
+	// Flush envoie ce qui reste dans le tampon : sans lui, rien ne partirait.
+	bw := bufio.NewWriter(w)
+	text := StatusText(resp.Status)
+	if text == "" {
+		text = "Unknown"
+	}
+	bw.WriteString("HTTP/1.1 " + strconv.Itoa(resp.Status) + " " + text + "\r\n")
+	for _, name := range names {
+		bw.WriteString(name + ": " + headers[name] + "\r\n")
+	}
+	bw.WriteString("\r\n")
+	bw.Write(resp.Body)
+	// Les erreurs des WriteString précédents sont gardées par le bufio.Writer et rendues ici.
+	return bw.Flush()
+}
+
+// ErrorResponse fabrique une réponse d'erreur en texte brut, par ex. « 404 Not Found ».
+func ErrorResponse(status int) *Response {
+	return &Response{
+		Status:  status,
+		Headers: map[string]string{"Content-Type": "text/plain; charset=utf-8"},
+		Body:    []byte(strconv.Itoa(status) + " " + StatusText(status) + "\n"),
+	}
+}

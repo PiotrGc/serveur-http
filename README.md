@@ -6,7 +6,7 @@ Son usage : partager un dossier en lecture seule sur le Wi-Fi pour lire ses PDF 
 
 ## État
 - [x] **V0.0** : le parser de requêtes (RFC 9112), avec les limites de taille et des refus stricts (400 / 414 / 431 / 501 / 505)
-- [ ] V0.1 : premier client TCP
+- [x] **V0.1** : serveur TCP qui répond « Hello », réponses d'erreur, `recover` des handlers, fermeture en douceur (lingering close)
 - [ ] V0.2 : servir un dossier
 - [ ] V0.3 : concurrence et robustesse
 - [ ] V0.4 : keep-alive
@@ -15,7 +15,13 @@ Son usage : partager un dossier en lecture seule sur le Wi-Fi pour lire ses PDF 
 - [ ] V0.7 : accès Wi-Fi avec mot de passe
 - [ ] V1.0 : benchmark et release
 
+## Lancer
+```sh
+go run ./cmd/serveur-http -port 8080
+curl -i http://127.0.0.1:8080/
+```
+
 ## Tests
 ```sh
-go test ./...
+go test -race ./...   # -race demande cgo (gcc) sur Windows
 ```
