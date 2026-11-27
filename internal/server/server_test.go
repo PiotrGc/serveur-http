@@ -61,12 +61,13 @@ func echanger(t *testing.T, addr, brut string) string {
 	return string(rep)
 }
 
-// TestHelloOctets : la réponse exacte à un GET, puis la fermeture de la connexion.
+// TestHelloOctets : la réponse exacte à un GET. Depuis la V0.4, HTTP/1.1 garde la connexion
+// (keep-alive) ; elle se ferme ensuite parce que le client a fini d'envoyer (CloseWrite dans echanger).
 func TestHelloOctets(t *testing.T) {
 	addr := demarrer(t)
 	rep := echanger(t, addr, "GET / HTTP/1.1\r\nHost: test\r\n\r\n")
 	attendu := "HTTP/1.1 200 OK\r\n" +
-		"Connection: close\r\n" +
+		"Connection: keep-alive\r\n" +
 		"Content-Length: 6\r\n" +
 		"Content-Type: text/plain; charset=utf-8\r\n" +
 		"Date: Sun, 22 Nov 2026 15:04:05 GMT\r\n" +

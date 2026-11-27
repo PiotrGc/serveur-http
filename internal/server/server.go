@@ -8,6 +8,7 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"io"
@@ -25,6 +26,12 @@ const (
 	DefaultReadTimeout  = 10 * time.Second // pour recevoir la ligne de requête et tous les en-têtes
 	DefaultWriteTimeout = 30 * time.Second // sans aucun octet envoyé (voir deadlineWriter)
 	DefaultMaxConns     = 100
+	DefaultIdleTimeout  = 30 * time.Second // attente de la requête suivante sur une connexion keep-alive
+	DefaultMaxRequests  = 100              // requêtes par connexion, avant de la fermer
+
+	// MaxDiscardBody : taille maximale d'un corps de requête qu'on lit pour le sauter (1 Mio).
+	// Au-delà, on répond puis on ferme la connexion : lire 10 Go juste pour les jeter serait absurde.
+	MaxDiscardBody = 1 << 20
 )
 
 // Handler reçoit une requête valide et rend la réponse à envoyer.
@@ -45,6 +52,11 @@ type Server struct {
 	WriteTimeout time.Duration
 	// MaxConns : nombre maximum de connexions traitées en même temps. Les suivantes attendent.
 	MaxConns int
+	// IdleTimeout : combien de temps une connexion keep-alive peut attendre sa requête suivante.
+	IdleTimeout time.Duration
+	// MaxRequestsPerConn : nombre de requêtes servies sur une connexion avant de la fermer.
+	// Ça borne la durée de vie d'une connexion, et donc la place qu'un client garde.
+	MaxRequestsPerConn int
 	// Logf écrit une ligne de journal. nil = log.Printf (sortie d'erreur, avec la date).
 	Logf func(format string, args ...any)
 
@@ -179,7 +191,8 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 }
 
-// handleConn traite une connexion : une requête, une réponse, puis la fermeture.
+// handleConn traite une connexion : une requête après l'autre (keep-alive), jusqu'à ce que
+// le client ou le serveur décide de fermer.
 func (s *Server) handleConn(conn net.Conn) {
 	// defer : conn.Close() s'exécute à la sortie de la fonction, quel que soit le chemin pris.
 	defer conn.Close()
@@ -191,35 +204,79 @@ func (s *Server) handleConn(conn net.Conn) {
 		}
 	}()
 
-	// Le délai couvre toute la lecture de la requête : il est fixé une seule fois, avant de lire.
-	conn.SetReadDeadline(time.Now().Add(valeur(s.ReadTimeout, DefaultReadTimeout)))
-	// Le même lecteur avec tampon doit servir pour toute la connexion (voir http1.NewReader).
+	// Le même lecteur avec tampon sert pour toute la connexion : il peut déjà contenir le début
+	// de la requête suivante (pipelining), qu'un nouveau lecteur perdrait.
 	br := http1.NewReader(conn)
+	w := deadlineWriter{conn: conn, timeout: valeur(s.WriteTimeout, DefaultWriteTimeout)}
+	max := valeur(s.MaxRequestsPerConn, DefaultMaxRequests)
+
+	for n := 1; ; n++ {
+		if n > 1 {
+			// Entre deux requêtes : on attend le premier octet de la suivante, au plus IdleTimeout.
+			// Peek(1) regarde cet octet sans le consommer : le parser le lira ensuite normalement.
+			conn.SetReadDeadline(time.Now().Add(valeur(s.IdleTimeout, DefaultIdleTimeout)))
+			// Ordre important : on pose le délai PUIS on regarde closing. Si Shutdown passe juste avant,
+			// on voit closing ; s'il passe juste après, son délai « maintenant » remplace le nôtre.
+			if s.isClosing() {
+				return
+			}
+			if _, err := br.Peek(1); err != nil {
+				return // client parti, inactif trop longtemps, ou arrêt : fermeture sans rien envoyer
+			}
+		}
+		// Le délai couvre toute la lecture de la requête : il est fixé une seule fois, avant de lire.
+		conn.SetReadDeadline(time.Now().Add(valeur(s.ReadTimeout, DefaultReadTimeout)))
+		if s.isClosing() && n > 1 {
+			return
+		}
+		if !s.serveOne(conn, br, w, n >= max) {
+			return
+		}
+	}
+}
+
+// serveOne lit une requête, la traite et écrit la réponse.
+// last : c'est la dernière requête autorisée sur cette connexion (MaxRequestsPerConn).
+// Rend true si la connexion doit rester ouverte pour une requête suivante.
+func (s *Server) serveOne(conn net.Conn, br *bufio.Reader, w io.Writer, last bool) bool {
 	req, err := http1.ParseRequest(br)
 	debut := time.Now()
-	w := deadlineWriter{conn: conn, timeout: valeur(s.WriteTimeout, DefaultWriteTimeout)}
 
 	var perr *http1.ParseError
 	switch {
 	case err == io.EOF:
-		return // le client s'est connecté puis a fermé sans rien envoyer : rien à répondre
+		return false // le client a fermé sans envoyer de requête : rien à répondre
 	case errors.Is(err, os.ErrDeadlineExceeded):
 		// Le délai de lecture est dépassé. Pendant un arrêt, c'est Shutdown qui l'a provoqué :
 		// on ferme sans rien dire. Sinon, le client était trop lent : 408 Request Timeout.
 		if s.isClosing() {
-			return
+			return false
 		}
-		s.write(w, http1.ErrorResponse(408))
-		s.logRequest(conn, "-", "-", 408, debut)
-		lingeringClose(conn)
-		return
+		s.refuse(conn, w, 408, debut)
+		return false
 	case errors.As(err, &perr):
-		s.write(w, http1.ErrorResponse(perr.Status))
-		s.logRequest(conn, "-", "-", perr.Status, debut)
-		lingeringClose(conn)
-		return
+		s.refuse(conn, w, perr.Status, debut)
+		return false
 	case err != nil:
-		return // erreur réseau (connexion coupée) : impossible de répondre
+		return false // erreur réseau (connexion coupée) : impossible de répondre
+	}
+
+	// Le corps de la requête : on ne l'utilise pas (lecture seule), mais il faut le lire pour
+	// le sauter, sinon ses octets seraient pris pour la requête suivante.
+	bodyLen, err := http1.BodyLength(req)
+	if errors.As(err, &perr) {
+		s.refuse(conn, w, perr.Status, debut)
+		return false
+	}
+	keep := http1.WantsKeepAlive(req) && !last
+	tooBig := bodyLen > MaxDiscardBody
+	if tooBig {
+		keep = false // on ne lit pas un énorme corps juste pour le jeter : on fermera après la réponse
+	} else if bodyLen > 0 {
+		// io.CopyN vers io.Discard : lire exactement bodyLen octets et les jeter.
+		if _, err := io.CopyN(io.Discard, br, bodyLen); err != nil {
+			return false // corps incomplet (client parti ou trop lent) : on ne peut plus rien lire de sûr
+		}
 	}
 
 	resp := s.callHandler(req)
@@ -228,8 +285,22 @@ func (s *Server) handleConn(conn net.Conn) {
 	if req.Method == "HEAD" {
 		resp.OmitBody = true
 	}
-	s.write(w, resp)
+	// Pendant un arrêt, on prévient le client que c'est la dernière réponse.
+	resp.KeepAlive = keep && !s.isClosing()
+	ok := s.write(w, resp)
 	s.logRequest(conn, req.Method, req.Target, resp.Status, debut)
+	if tooBig {
+		lingeringClose(conn) // le corps non lu provoquerait sinon un reset qui ferait perdre la réponse
+	}
+	return ok && resp.KeepAlive
+}
+
+// refuse répond avec un code d'erreur, puis ferme en douceur (lingeringClose).
+// Après une requête mal formée, on ne sait plus où commence la suivante : la connexion est perdue.
+func (s *Server) refuse(conn net.Conn, w io.Writer, status int, debut time.Time) {
+	s.write(w, http1.ErrorResponse(status))
+	s.logRequest(conn, "-", "-", status, debut)
+	lingeringClose(conn)
 }
 
 // callHandler appelle le handler et transforme un plantage (panic) en réponse 500.
@@ -251,7 +322,8 @@ func (s *Server) callHandler(req *http1.Request) (resp *http1.Response) {
 // Si un en-tête est invalide, rien n'a encore été envoyé : on peut répondre 500 à la place.
 // Pour toute autre erreur (client parti, délai dépassé, fichier tronqué), une partie est peut-être
 // déjà partie : on n'écrit plus rien, et la connexion sera fermée par handleConn.
-func (s *Server) write(w io.Writer, resp *http1.Response) {
+// Rend true si la réponse prévue est partie en entier (la connexion peut alors resservir).
+func (s *Server) write(w io.Writer, resp *http1.Response) bool {
 	if resp.File != nil {
 		// Fermer le fichier dans tous les cas : sinon chaque requête garderait un descripteur ouvert.
 		defer resp.File.Close()
@@ -262,13 +334,15 @@ func (s *Server) write(w io.Writer, resp *http1.Response) {
 	}
 	err := http1.WriteResponse(w, resp, now())
 	if err == nil {
-		return
+		return true
 	}
 	s.logf("écriture de la réponse : %v", err)
 	// errors.Is suit les erreurs « enveloppées » avec %w pour retrouver ErrInvalidHeader.
+	// La 500 de remplacement annonce « Connection: close » (KeepAlive vaut false).
 	if errors.Is(err, http1.ErrInvalidHeader) {
 		http1.WriteResponse(w, http1.ErrorResponse(500), now())
 	}
+	return false
 }
 
 // deadlineWriter relance le délai d'écriture avant chaque morceau envoyé.

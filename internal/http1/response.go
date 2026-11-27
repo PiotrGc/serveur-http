@@ -35,6 +35,9 @@ type Response struct {
 	Size int64 // nombre d'octets de File à envoyer ; ignoré si File vaut nil
 	// OmitBody : pour HEAD, on envoie les mêmes en-têtes (Content-Length compris) mais pas le corps.
 	OmitBody bool
+	// KeepAlive : le serveur garde la connexion ouverte après cette réponse (« Connection: keep-alive »).
+	// false par défaut : « Connection: close ». C'est le serveur qui le décide, pas le handler.
+	KeepAlive bool
 }
 
 // statusText : le texte standard de chaque code utilisé (RFC 9110 §15, RFC 6585 §5 pour 431).
@@ -75,9 +78,14 @@ func WriteResponse(w io.Writer, resp *Response, now time.Time) error {
 		"Content-Length": strconv.FormatInt(length, 10),
 		// Format imposé par la RFC 9110 §5.6.7 (IMF-fixdate), toujours en GMT.
 		// En Go, on décrit un format avec la date de référence « Mon Jan 2 15:04:05 2006 ».
-		"Date":       now.UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT"),
-		"Server":     ServerName,
-		"Connection": "close", // RFC 9112 §9.6 : on annonce qu'on ferme après cette réponse
+		"Date":   now.UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT"),
+		"Server": ServerName,
+		// RFC 9112 §9.6 : on annonce si on ferme après cette réponse. « keep-alive » est implicite en
+		// HTTP/1.1, mais l'écrire est sans risque et indispensable pour un client HTTP/1.0.
+		"Connection": "close",
+	}
+	if resp.KeepAlive {
+		headers["Connection"] = "keep-alive"
 	}
 	for name, value := range resp.Headers {
 		if autoHeaders[strings.ToLower(name)] {
