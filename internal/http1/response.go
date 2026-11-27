@@ -18,6 +18,11 @@ import (
 // ServerName est la valeur de l'en-tête Server envoyé dans chaque réponse.
 const ServerName = "serveur-http"
 
+// TimeFormat : le format des dates HTTP (RFC 9110 §5.6.7, « IMF-fixdate »), toujours en GMT.
+// En Go, on décrit un format avec la date de référence « Mon Jan 2 15:04:05 2006 ».
+// Il sert pour Date, Last-Modified, If-Modified-Since et If-Range.
+const TimeFormat = "Mon, 02 Jan 2006 15:04:05 GMT"
+
 // ErrInvalidHeader : WriteResponse a refusé un en-tête, et rien n'a été écrit.
 var ErrInvalidHeader = errors.New("en-tête de réponse invalide")
 
@@ -43,13 +48,16 @@ type Response struct {
 // statusText : le texte standard de chaque code utilisé (RFC 9110 §15, RFC 6585 §5 pour 431).
 var statusText = map[int]string{
 	200: "OK",
+	206: "Partial Content",
 	301: "Moved Permanently",
+	304: "Not Modified",
 	400: "Bad Request",
 	403: "Forbidden",
 	404: "Not Found",
 	405: "Method Not Allowed",
 	408: "Request Timeout",
 	414: "URI Too Long",
+	416: "Range Not Satisfiable",
 	431: "Request Header Fields Too Large",
 	500: "Internal Server Error",
 	501: "Not Implemented",
@@ -76,16 +84,20 @@ func WriteResponse(w io.Writer, resp *Response, now time.Time) error {
 	}
 	headers := map[string]string{
 		"Content-Length": strconv.FormatInt(length, 10),
-		// Format imposé par la RFC 9110 §5.6.7 (IMF-fixdate), toujours en GMT.
-		// En Go, on décrit un format avec la date de référence « Mon Jan 2 15:04:05 2006 ».
-		"Date":   now.UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT"),
-		"Server": ServerName,
+		"Date":           now.UTC().Format(TimeFormat),
+		"Server":         ServerName,
 		// RFC 9112 §9.6 : on annonce si on ferme après cette réponse. « keep-alive » est implicite en
 		// HTTP/1.1, mais l'écrire est sans risque et indispensable pour un client HTTP/1.0.
 		"Connection": "close",
 	}
 	if resp.KeepAlive {
 		headers["Connection"] = "keep-alive"
+	}
+	// RFC 9110 §15.4.5 : une 304 n'a jamais de corps. On n'envoie pas non plus Content-Length,
+	// qui dirait « le fichier fait 0 octet » alors qu'il n'a simplement pas changé.
+	noBody := resp.Status == 304
+	if noBody {
+		delete(headers, "Content-Length")
 	}
 	for name, value := range resp.Headers {
 		if autoHeaders[strings.ToLower(name)] {
@@ -121,8 +133,8 @@ func WriteResponse(w io.Writer, resp *Response, now time.Time) error {
 	}
 	bw.WriteString("\r\n")
 	switch {
-	case resp.OmitBody:
-		// HEAD : rien après la ligne vide.
+	case resp.OmitBody || noBody:
+		// HEAD ou 304 : rien après la ligne vide.
 	case resp.File != nil:
 		// io.CopyN copie exactement Size octets par morceaux (32 Kio à la fois), sans tout charger.
 		// Si le fichier a moins d'octets que prévu, CopyN rend io.EOF : on remonte l'erreur pour que

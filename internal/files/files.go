@@ -6,12 +6,16 @@ package files
 
 import (
 	"errors"
+	"fmt"
+	"io"
 	"io/fs"
 	"net/url"
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/PiotrGc/serveur-http/internal/http1"
 )
@@ -73,9 +77,9 @@ func (d *Dir) Serve(req *http1.Request) *http1.Response {
 			resp.Headers["Location"] = (&url.URL{Path: urlPath + "/"}).EscapedPath()
 			return resp
 		}
-		return serveDir(root, f, urlPath, rel)
+		return serveDir(root, f, urlPath, rel, req)
 	}
-	return serveFile(f, info)
+	return serveFile(f, info, req)
 }
 
 // cleanPath transforme la cible brute (« /cours/mon%20td.pdf?x=1 ») en :
@@ -132,31 +136,80 @@ func openError(err error) *http1.Response {
 }
 
 // serveFile répond avec le contenu du fichier, lu en continu par le serveur (qui le fermera).
-func serveFile(f *os.File, info fs.FileInfo) *http1.Response {
+// Selon les en-têtes de la requête, la réponse est :
+//   - 304 si le client a déjà la version actuelle (If-Modified-Since) ;
+//   - 206 avec un morceau du fichier (Range), ou 416 si ce morceau est hors du fichier ;
+//   - 200 avec le fichier entier sinon.
+func serveFile(f *os.File, info fs.FileInfo, req *http1.Request) *http1.Response {
 	// Seulement les fichiers normaux : pas de périphérique, de tube nommé ni de socket.
 	if !info.Mode().IsRegular() {
 		f.Close()
 		return http1.ErrorResponse(403)
 	}
-	return &http1.Response{
-		Status: 200,
-		Headers: map[string]string{
-			"Content-Type": contentType(info.Name()),
-			// nosniff : le navigateur respecte notre Content-Type au lieu de « deviner ».
-			// Sans ça, un .txt qui contient du HTML pourrait être exécuté comme une page.
-			"X-Content-Type-Options": "nosniff",
-		},
-		File: f,
-		Size: info.Size(),
+	size := info.Size()
+	// Les dates HTTP sont à la seconde : on tronque la date du fichier (qui a des nanosecondes),
+	// sinon elle serait toujours « plus récente » que la date renvoyée par le navigateur.
+	modTime := info.ModTime().UTC().Truncate(time.Second)
+	lastModified := modTime.Format(http1.TimeFormat)
+	headers := map[string]string{
+		"Content-Type": contentType(info.Name()),
+		// nosniff : le navigateur respecte notre Content-Type au lieu de « deviner ».
+		// Sans ça, un .txt qui contient du HTML pourrait être exécuté comme une page.
+		"X-Content-Type-Options": "nosniff",
+		// Accept-Ranges : on annonce qu'on sait envoyer des morceaux (le lecteur vidéo en a besoin).
+		"Accept-Ranges": "bytes",
+		"Last-Modified": lastModified,
 	}
+
+	// If-Modified-Since (RFC 9110 §13.1.3) : le navigateur a une copie datée ; si le fichier n'a pas
+	// changé depuis, on répond 304 sans corps, et il réutilise sa copie. Une date illisible est ignorée.
+	if ims, err := time.Parse(http1.TimeFormat, req.Headers["if-modified-since"]); err == nil && !modTime.After(ims) {
+		f.Close()
+		return &http1.Response{Status: 304, Headers: map[string]string{"Last-Modified": lastModified, "Accept-Ranges": "bytes"}}
+	}
+
+	// Range ne vaut que pour GET (RFC 9110 §14.2). If-Range : le client veut un morceau SEULEMENT si
+	// le fichier n'a pas changé depuis la date qu'il donne. Sinon, il recollerait un morceau du nouveau
+	// fichier à la fin de l'ancien : on lui renvoie alors le fichier entier.
+	rangeHeader := req.Headers["range"]
+	if ifRange, ok := req.Headers["if-range"]; ok && ifRange != lastModified {
+		rangeHeader = ""
+	}
+	if req.Method == "GET" && rangeHeader != "" {
+		switch state, start, end := http1.ParseRange(rangeHeader, size); state {
+		case http1.RangeUnsatisfiable:
+			f.Close()
+			resp := http1.ErrorResponse(416)
+			// RFC 9110 §15.5.17 : on indique la vraie taille, pour que le client puisse corriger.
+			resp.Headers["Content-Range"] = "bytes */" + strconv.FormatInt(size, 10)
+			return resp
+		case http1.RangeOK:
+			length := end - start + 1
+			headers["Content-Range"] = fmt.Sprintf("bytes %d-%d/%d", start, end, size)
+			return &http1.Response{
+				Status:  206,
+				Headers: headers,
+				// io.NewSectionReader lit seulement la tranche [start, start+length) du fichier, sans
+				// lire ce qui précède. Le struct anonyme assemble ce lecteur avec le Close du fichier,
+				// pour que le serveur ferme bien le fichier après l'envoi.
+				File: struct {
+					io.Reader
+					io.Closer
+				}{io.NewSectionReader(f, start, length), f},
+				Size: length,
+			}
+		}
+	}
+
+	return &http1.Response{Status: 200, Headers: headers, File: f, Size: size}
 }
 
 // serveDir sert index.html s'il existe dans le dossier, sinon la page de listing.
-func serveDir(root *os.Root, dir *os.File, urlPath, rel string) *http1.Response {
+func serveDir(root *os.Root, dir *os.File, urlPath, rel string, req *http1.Request) *http1.Response {
 	if idx, err := root.Open(filepath.FromSlash(path.Join(rel, "index.html"))); err == nil {
 		if info, err := idx.Stat(); err == nil && info.Mode().IsRegular() {
 			dir.Close()
-			return serveFile(idx, info)
+			return serveFile(idx, info, req)
 		}
 		idx.Close()
 	}
