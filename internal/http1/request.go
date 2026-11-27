@@ -35,6 +35,9 @@ type Request struct {
 	Target  string            // la cible telle qu'envoyée, ex. "/cours/td1.pdf" (pas encore décodée)
 	Proto   string            // "HTTP/1.1" ou "HTTP/1.0"
 	Headers map[string]string // nom en minuscules → valeur (les répétitions sont fusionnées avec ", ")
+	// RemoteAddr : l'IP du client, sans le port (ex. "192.168.1.30"). Elle n'est pas dans les octets
+	// de la requête : c'est le serveur qui la pose, d'après la connexion TCP. Le parser la laisse vide.
+	RemoteAddr string
 }
 
 // NewReader enveloppe une connexion dans un lecteur avec tampon.

@@ -55,15 +55,18 @@ var statusText = map[int]string{
 	301: "Moved Permanently",
 	304: "Not Modified",
 	400: "Bad Request",
+	401: "Unauthorized",
 	403: "Forbidden",
 	404: "Not Found",
 	405: "Method Not Allowed",
 	408: "Request Timeout",
 	414: "URI Too Long",
 	416: "Range Not Satisfiable",
+	429: "Too Many Requests",
 	431: "Request Header Fields Too Large",
 	500: "Internal Server Error",
 	501: "Not Implemented",
+	503: "Service Unavailable",
 	505: "HTTP Version Not Supported",
 }
 

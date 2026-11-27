@@ -28,6 +28,9 @@ const (
 	DefaultMaxConns     = 100
 	DefaultIdleTimeout  = 30 * time.Second // attente de la requête suivante sur une connexion keep-alive
 	DefaultMaxRequests  = 100              // requêtes par connexion, avant de la fermer
+	DefaultMaxPerIP     = 10               // connexions simultanées par IP (un navigateur en ouvre jusqu'à 6)
+	DefaultMinRate      = 1 << 10          // 1 Kio/s : débit minimum d'une réponse
+	DefaultRateWindow   = 30 * time.Second // fenêtre sur laquelle le débit minimum est mesuré
 
 	// MaxDiscardBody : taille maximale d'un corps de requête qu'on lit pour le sauter (1 Mio).
 	// Au-delà, on répond puis on ferme la connexion : lire 10 Go juste pour les jeter serait absurde.
@@ -50,8 +53,16 @@ type Server struct {
 	// WriteTimeout : temps maximum pendant lequel le client peut ne rien accepter.
 	// Il est relancé à chaque morceau envoyé, donc un long téléchargement qui avance n'est pas coupé.
 	WriteTimeout time.Duration
-	// MaxConns : nombre maximum de connexions traitées en même temps. Les suivantes attendent.
+	// MaxConns : nombre maximum de connexions traitées en même temps. Au-delà, réponse 503 immédiate.
 	MaxConns int
+	// MaxConnsPerIP : nombre maximum de connexions simultanées venant d'une même IP. Au-delà, 503.
+	// Sans cette limite, une seule machine pourrait prendre toutes les places de MaxConns.
+	MaxConnsPerIP int
+	// MinRate (octets par seconde) et RateWindow : une réponse dont le débit reste sous MinRate
+	// pendant toute une fenêtre RateWindow est coupée. C'est la parade au client qui lit 1 octet de
+	// temps en temps pour garder sa place indéfiniment (« slow read »).
+	MinRate    int64
+	RateWindow time.Duration
 	// IdleTimeout : combien de temps une connexion keep-alive peut attendre sa requête suivante.
 	IdleTimeout time.Duration
 	// MaxRequestsPerConn : nombre de requêtes servies sur une connexion avant de la fermer.
@@ -65,6 +76,7 @@ type Server struct {
 	mu      sync.Mutex
 	ln      net.Listener
 	conns   map[net.Conn]struct{} // les connexions ouvertes (une map utilisée comme ensemble)
+	perIP   map[string]int        // nombre de connexions servies par IP
 	closing bool                  // Shutdown a commencé
 	// wg compte les connexions en cours de traitement, pour que Shutdown sache quand tout est fini.
 	wg sync.WaitGroup
@@ -87,63 +99,122 @@ func (s *Server) Serve(ln net.Listener) error {
 	s.ln = ln
 	if s.conns == nil {
 		s.conns = map[net.Conn]struct{}{}
+		s.perIP = map[string]int{}
 	}
 	s.mu.Unlock()
 
 	// Sémaphore : un channel avec une capacité de MaxConns. Prendre une place = y envoyer une valeur,
-	// ce qui bloque quand il est plein. Rendre une place = en retirer une.
-	// On prend la place AVANT Accept : quand tout est occupé, les nouveaux clients attendent
-	// dans la file d'attente du système, sans qu'on dépense de mémoire pour eux.
+	// rendre une place = en retirer une.
 	sem := make(chan struct{}, valeur(s.MaxConns, DefaultMaxConns))
 	for {
-		sem <- struct{}{}
 		// Accept attend (bloque) jusqu'à ce qu'un client se connecte.
 		conn, err := ln.Accept()
 		if err != nil {
-			<-sem
 			// net.ErrClosed : quelqu'un a fermé ln (arrêt du serveur ou fin d'un test). Ce n'est pas une panne.
 			if errors.Is(err, net.ErrClosed) {
 				return nil
 			}
 			return err
 		}
-		if !s.track(conn) {
-			conn.Close() // Shutdown a commencé entre Accept et ici
-			<-sem
-			return nil
+		ip := hostOf(conn)
+
+		// select avec default : on essaie de prendre une place SANS attendre. Si tout est plein, on
+		// refuse ce client tout de suite (503) au lieu de bloquer Accept : depuis la V0.7, des clients
+		// lents ne peuvent plus bloquer la file d'attente de tout le monde.
+		full := false
+		select {
+		case sem <- struct{}{}:
+		default:
+			full = true
 		}
-		// go : handleConn tourne en parallèle, et la boucle retourne tout de suite à Accept.
-		// C'est ce qui permet de servir 200 clients en même temps.
-		go func() {
-			defer func() {
-				s.untrack(conn)
-				<-sem // rend la place
+		switch s.track(conn, ip, full) {
+		case trackClosing:
+			conn.Close() // Shutdown a commencé entre Accept et ici
+			if !full {
+				<-sem
+			}
+			return nil
+		case trackRejected:
+			if !full {
+				<-sem // la place prise n'est pas utilisée : la limite par IP est atteinte
+			}
+			go func() {
+				defer s.untrack(conn, ip, false)
+				s.reject(conn, ip)
 			}()
-			s.handleConn(conn)
-		}()
+		case trackOK:
+			// go : handleConn tourne en parallèle, et la boucle retourne tout de suite à Accept.
+			// C'est ce qui permet de servir 200 clients en même temps.
+			go func() {
+				defer func() {
+					s.untrack(conn, ip, true)
+					<-sem // rend la place
+				}()
+				s.handleConn(conn, ip)
+			}()
+		}
 	}
 }
 
-// track ajoute conn aux connexions suivies. Rend false si Shutdown a déjà commencé.
+// Résultats possibles de track.
+const (
+	trackOK       = iota // la connexion est servie
+	trackRejected        // serveur plein ou limite par IP atteinte : réponse 503
+	trackClosing         // Shutdown a commencé : on ferme sans rien dire
+)
+
+// track ajoute conn aux connexions suivies (aussi celles qu'on refuse, pour que Shutdown les attende)
+// et décide si elle est servie. full : il ne restait aucune place globale.
 // wg.Add se fait sous le même verrou que le test de closing : Shutdown ne peut donc pas
 // commencer à attendre (wg.Wait) pendant qu'une nouvelle connexion s'ajoute.
-func (s *Server) track(conn net.Conn) bool {
+func (s *Server) track(conn net.Conn, ip string, full bool) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closing {
-		return false
+		return trackClosing
 	}
 	s.conns[conn] = struct{}{}
 	s.wg.Add(1)
-	return true
+	if full || s.perIP[ip] >= valeur(s.MaxConnsPerIP, DefaultMaxPerIP) {
+		return trackRejected
+	}
+	s.perIP[ip]++
+	return trackOK
 }
 
-// untrack retire conn des connexions suivies, une fois son traitement fini.
-func (s *Server) untrack(conn net.Conn) {
+// untrack retire conn des connexions suivies. counted : elle comptait dans la limite de son IP.
+func (s *Server) untrack(conn net.Conn, ip string, counted bool) {
 	s.mu.Lock()
 	delete(s.conns, conn)
+	if counted {
+		s.perIP[ip]--
+		if s.perIP[ip] == 0 {
+			delete(s.perIP, ip) // pas d'entrée qui traîne pour une IP qui n'a plus de connexion
+		}
+	}
 	s.mu.Unlock()
 	s.wg.Done()
+}
+
+// reject répond 503 tout de suite, puis ferme. Retry-After invite le client à réessayer dans 1 s.
+// Délai d'écriture court : un client qu'on refuse ne doit pas pouvoir nous occuper longtemps.
+func (s *Server) reject(conn net.Conn, ip string) {
+	defer conn.Close()
+	resp := http1.ErrorResponse(503)
+	resp.Headers["Retry-After"] = "1"
+	conn.SetWriteDeadline(time.Now().Add(time.Second))
+	http1.WriteResponse(conn, resp, s.now())
+	s.logf("%s - - 503 (trop de connexions)", ip)
+	lingeringClose(conn) // sa requête est peut-être déjà arrivée : sans ça, le reset ferait perdre la 503
+}
+
+// hostOf rend l'IP du client, sans le port (« 192.168.1.30:52341 » → « 192.168.1.30 »).
+func hostOf(conn net.Conn) string {
+	ip, _, err := net.SplitHostPort(conn.RemoteAddr().String())
+	if err != nil {
+		return conn.RemoteAddr().String()
+	}
+	return ip
 }
 
 // isClosing dit si Shutdown a commencé.
@@ -193,7 +264,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 // handleConn traite une connexion : une requête après l'autre (keep-alive), jusqu'à ce que
 // le client ou le serveur décide de fermer.
-func (s *Server) handleConn(conn net.Conn) {
+func (s *Server) handleConn(conn net.Conn, ip string) {
 	// defer : conn.Close() s'exécute à la sortie de la fonction, quel que soit le chemin pris.
 	defer conn.Close()
 	// Un panic n'importe où dans le traitement (parser, écriture, Now…) ne doit tuer que cette
@@ -207,7 +278,6 @@ func (s *Server) handleConn(conn net.Conn) {
 	// Le même lecteur avec tampon sert pour toute la connexion : il peut déjà contenir le début
 	// de la requête suivante (pipelining), qu'un nouveau lecteur perdrait.
 	br := http1.NewReader(conn)
-	w := deadlineWriter{conn: conn, timeout: valeur(s.WriteTimeout, DefaultWriteTimeout)}
 	max := valeur(s.MaxRequestsPerConn, DefaultMaxRequests)
 
 	for n := 1; ; n++ {
@@ -229,7 +299,7 @@ func (s *Server) handleConn(conn net.Conn) {
 		if s.isClosing() && n > 1 {
 			return
 		}
-		if !s.serveOne(conn, br, w, n >= max) {
+		if !s.serveOne(conn, ip, br, n >= max) {
 			return
 		}
 	}
@@ -238,9 +308,15 @@ func (s *Server) handleConn(conn net.Conn) {
 // serveOne lit une requête, la traite et écrit la réponse.
 // last : c'est la dernière requête autorisée sur cette connexion (MaxRequestsPerConn).
 // Rend true si la connexion doit rester ouverte pour une requête suivante.
-func (s *Server) serveOne(conn net.Conn, br *bufio.Reader, w io.Writer, last bool) bool {
+func (s *Server) serveOne(conn net.Conn, ip string, br *bufio.Reader, last bool) bool {
 	req, err := http1.ParseRequest(br)
 	debut := time.Now()
+	// Un writer neuf par réponse : la mesure du débit minimum recommence à chaque réponse
+	// (le temps passé à attendre la requête suivante ne doit pas compter comme de la lenteur).
+	w := &deadlineWriter{
+		conn: conn, timeout: valeur(s.WriteTimeout, DefaultWriteTimeout),
+		minRate: valeur(s.MinRate, DefaultMinRate), window: valeur(s.RateWindow, DefaultRateWindow),
+	}
 
 	var perr *http1.ParseError
 	switch {
@@ -279,6 +355,7 @@ func (s *Server) serveOne(conn net.Conn, br *bufio.Reader, w io.Writer, last boo
 		}
 	}
 
+	req.RemoteAddr = ip // le handler (et l'authentification) en a besoin pour savoir qui demande
 	resp := s.callHandler(req)
 	// RFC 9110 §9.3.2 : HEAD rend exactement les en-têtes de GET, sans le corps.
 	// C'est géré ici une fois pour toutes, plutôt que dans chaque handler.
@@ -328,11 +405,7 @@ func (s *Server) write(w io.Writer, resp *http1.Response) bool {
 		// Fermer le fichier dans tous les cas : sinon chaque requête garderait un descripteur ouvert.
 		defer resp.File.Close()
 	}
-	now := time.Now
-	if s.Now != nil {
-		now = s.Now
-	}
-	err := http1.WriteResponse(w, resp, now())
+	err := http1.WriteResponse(w, resp, s.now())
 	if err == nil {
 		return true
 	}
@@ -340,23 +413,57 @@ func (s *Server) write(w io.Writer, resp *http1.Response) bool {
 	// errors.Is suit les erreurs « enveloppées » avec %w pour retrouver ErrInvalidHeader.
 	// La 500 de remplacement annonce « Connection: close » (KeepAlive vaut false).
 	if errors.Is(err, http1.ErrInvalidHeader) {
-		http1.WriteResponse(w, http1.ErrorResponse(500), now())
+		http1.WriteResponse(w, http1.ErrorResponse(500), s.now())
 	}
 	return false
 }
 
-// deadlineWriter relance le délai d'écriture avant chaque morceau envoyé.
-// Pourquoi pas un seul délai pour toute la réponse : un rush de 4 Go sur le Wi-Fi prend plusieurs
-// minutes, et serait coupé. Ici, on coupe seulement un client qui n'accepte plus rien pendant
-// tout le délai (il ne lit plus, ou il a disparu sans fermer la connexion).
+// now : l'heure de l'en-tête Date (s.Now dans les tests, sinon l'heure réelle).
+func (s *Server) now() time.Time {
+	if s.Now != nil {
+		return s.Now()
+	}
+	return time.Now()
+}
+
+// errTooSlow : le client lit plus lentement que le débit minimum.
+var errTooSlow = errors.New("client trop lent : débit sous le minimum")
+
+// deadlineWriter protège l'envoi d'une réponse contre deux sortes de clients :
+//   - celui qui n'accepte plus rien : le délai d'écriture est relancé avant chaque morceau, donc on
+//     ne coupe qu'un client bloqué pendant tout le délai (un long téléchargement qui avance passe) ;
+//   - celui qui lit très lentement pour garder sa place (« slow read ») : on mesure les octets envoyés
+//     sur des fenêtres de durée window, et on coupe si une fenêtre complète reste sous minRate.
+//
+// Un deadlineWriter sert pour UNE réponse (voir serveOne) : il garde un état, d'où le pointeur.
 type deadlineWriter struct {
 	conn    net.Conn
 	timeout time.Duration
+	minRate int64         // octets par seconde
+	window  time.Duration // durée d'une fenêtre de mesure
+
+	windowStart time.Time // début de la fenêtre en cours (zéro avant la première écriture)
+	windowBytes int64     // octets envoyés depuis windowStart
 }
 
-func (d deadlineWriter) Write(p []byte) (int, error) {
-	d.conn.SetWriteDeadline(time.Now().Add(d.timeout))
-	return d.conn.Write(p)
+// Write envoie p. Le débit est contrôlé au début de chaque morceau (4 Kio au plus, à cause du
+// tampon de WriteResponse). Un seul morceau ne peut pas rester bloqué indéfiniment non plus :
+// l'échéance d'écriture le coupe s'il dépasse timeout. Les deux ensemble couvrent tous les rythmes lents.
+func (d *deadlineWriter) Write(p []byte) (int, error) {
+	now := time.Now()
+	if d.windowStart.IsZero() {
+		d.windowStart = now
+	} else if elapsed := now.Sub(d.windowStart); elapsed >= d.window {
+		// Fin d'une fenêtre : a-t-on envoyé au moins minRate octets par seconde ?
+		if float64(d.windowBytes) < float64(d.minRate)*elapsed.Seconds() {
+			return 0, errTooSlow
+		}
+		d.windowStart, d.windowBytes = now, 0
+	}
+	d.conn.SetWriteDeadline(now.Add(d.timeout))
+	n, err := d.conn.Write(p)
+	d.windowBytes += int64(n)
+	return n, err
 }
 
 // logRequest écrit une ligne par requête : IP, méthode, chemin, statut, durée.
@@ -382,7 +489,7 @@ func (s *Server) logf(format string, args ...any) {
 
 // valeur rend v, ou def si v vaut zéro. Les génériques ([T …]) permettent la même fonction
 // pour des durées et des entiers.
-func valeur[T time.Duration | int](v, def T) T {
+func valeur[T time.Duration | int | int64](v, def T) T {
 	if v == 0 {
 		return def
 	}

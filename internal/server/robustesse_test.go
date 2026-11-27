@@ -43,7 +43,7 @@ func TestConcurrence(t *testing.T) {
 	addr := lancer(t, &Server{Handler: func(r *http1.Request) *http1.Response {
 		time.Sleep(50 * time.Millisecond)
 		return Hello(r)
-	}, MaxConns: 300})
+	}, MaxConns: 300, MaxConnsPerIP: 300}) // les 200 clients du test viennent tous de 127.0.0.1
 
 	debut := time.Now()
 	// sync.WaitGroup : attendre que les 200 goroutines aient fini.
@@ -141,11 +141,12 @@ func TestClientInactifCoupe(t *testing.T) {
 	}
 }
 
-// TestLimiteConnexions : avec MaxConns = 2, le 3e client attend qu'une place se libère.
+// TestLimiteConnexions : avec MaxConns = 2, jamais plus de 2 requêtes dans le handler à la fois.
+// Depuis la V0.7, le 3e client reçoit 503 au lieu d'attendre (voir TestPleinRepond503).
 func TestLimiteConnexions(t *testing.T) {
 	libere := make(chan struct{})
 	var enCours atomic.Int32
-	addr := lancer(t, &Server{MaxConns: 2, Handler: func(r *http1.Request) *http1.Response {
+	addr := lancer(t, &Server{MaxConns: 2, MaxConnsPerIP: 10, Handler: func(r *http1.Request) *http1.Response {
 		enCours.Add(1)
 		<-libere // bloque jusqu'à ce que le test libère
 		return Hello(r)
@@ -160,13 +161,19 @@ func TestLimiteConnexions(t *testing.T) {
 		t.Fatalf("%d requêtes dans le handler, attendu 2 (la limite)", n)
 	}
 	close(libere)
+	var ok, refus int
 	for i := 0; i < 3; i++ {
-		if rep := <-reponses; !strings.HasPrefix(rep, "HTTP/1.1 200 OK") {
-			t.Fatalf("réponse %d : %q", i+1, rep)
+		switch rep := <-reponses; {
+		case strings.HasPrefix(rep, "HTTP/1.1 200 OK"):
+			ok++
+		case strings.HasPrefix(rep, "HTTP/1.1 503 "):
+			refus++
+		default:
+			t.Fatalf("réponse inattendue : %q", rep)
 		}
 	}
-	if n := enCours.Load(); n != 3 {
-		t.Fatalf("le 3e client n'a jamais été servi (%d)", n)
+	if ok != 2 || refus != 1 {
+		t.Fatalf("%d réponses 200 et %d refus 503, attendu 2 et 1", ok, refus)
 	}
 }
 

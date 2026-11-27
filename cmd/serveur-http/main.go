@@ -7,6 +7,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/PiotrGc/serveur-http/internal/auth"
 	"github.com/PiotrGc/serveur-http/internal/files"
 	"github.com/PiotrGc/serveur-http/internal/server"
 )
@@ -27,6 +29,7 @@ func main() {
 	port := flag.Int("port", 8080, "port d'écoute (1 à 65535)")
 	dir := flag.String("dir", ".", "dossier à partager en lecture seule")
 	maxConns := flag.Int("max-conns", server.DefaultMaxConns, "nombre maximum de connexions simultanées")
+	lan := flag.Bool("lan", false, "ouvrir au réseau local (Wi-Fi), avec un mot de passe tiré au hasard")
 	flag.Parse()
 	if *port < 1 || *port > 65535 {
 		log.Fatalf("port invalide : %d", *port)
@@ -46,16 +49,25 @@ func main() {
 	}
 	defer d.Close()
 
-	// 127.0.0.1 seulement : le serveur n'est joignable que depuis ce PC.
-	// L'ouverture au Wi-Fi se fera avec une option explicite en V0.7.
-	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(*port))
+	handler := server.Handler(d.Serve)
+	var password string
+	if *lan {
+		// Ouvert au Wi-Fi : n'importe quel appareil du réseau peut se connecter, donc mot de passe
+		// obligatoire. Il change à chaque lancement : rien à retenir, rien qui traîne dans un fichier.
+		if password, err = auth.NewPassword(); err != nil {
+			log.Fatalf("impossible de tirer un mot de passe : %v", err)
+		}
+		handler = (&auth.Guard{Password: password}).Wrap(d.Serve)
+	}
+
+	addr := listenAddr(*lan, *port)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		log.Fatalf("impossible d'écouter sur %s : %v", addr, err)
 	}
-	log.Printf("serveur-http partage %s (lecture seule) sur http://%s — Ctrl+C pour arrêter", abs, addr)
+	printBanner(abs, *lan, *port, password)
 
-	srv := &server.Server{Handler: d.Serve, MaxConns: *maxConns}
+	srv := &server.Server{Handler: handler, MaxConns: *maxConns}
 
 	// signal.NotifyContext rend un contexte qui est « annulé » quand le programme reçoit Ctrl+C
 	// (os.Interrupt). Sans ça, Ctrl+C tuerait le programme net, en coupant les téléchargements en cours.
@@ -81,4 +93,52 @@ func main() {
 		}
 		log.Print("arrêt propre terminé")
 	}
+}
+
+// listenAddr : 127.0.0.1 par défaut (joignable seulement depuis ce PC), 0.0.0.0 avec -lan
+// (toutes les cartes réseau, donc le Wi-Fi).
+func listenAddr(lan bool, port int) string {
+	host := "127.0.0.1"
+	if lan {
+		host = "0.0.0.0"
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port))
+}
+
+// lanIPs rend les adresses IPv4 privées de ce PC (192.168.x.x, 10.x.x.x, 172.16-31.x.x) :
+// ce sont elles qu'on tape sur le téléphone. IsPrivate exclut déjà 127.0.0.1 et les adresses publiques.
+func lanIPs() []string {
+	var ips []string
+	// InterfaceAddrs liste les adresses de toutes les cartes réseau (Wi-Fi, Ethernet, VPN…).
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil
+	}
+	for _, a := range addrs {
+		// Assertion de type : une adresse de carte réseau est un *net.IPNet (adresse + masque).
+		if n, ok := a.(*net.IPNet); ok && n.IP.To4() != nil && n.IP.IsPrivate() {
+			ips = append(ips, n.IP.String())
+		}
+	}
+	return ips
+}
+
+// printBanner affiche ce qu'il faut savoir au lancement : dossier, adresses, mot de passe.
+func printBanner(dir string, lan bool, port int, password string) {
+	log.Printf("serveur-http partage %s (lecture seule) — Ctrl+C pour arrêter", dir)
+	if !lan {
+		log.Printf("sur ce PC seulement : http://127.0.0.1:%d (option -lan pour le téléphone)", port)
+		return
+	}
+	ips := lanIPs()
+	if len(ips) == 0 {
+		log.Print("aucune adresse de réseau local trouvée : le PC est-il connecté au Wi-Fi ?")
+	}
+	for _, ip := range ips {
+		log.Printf("sur le téléphone (même Wi-Fi) : http://%s:%d", ip, port)
+	}
+	// fmt.Printf vers la sortie standard, sans la date : le mot de passe ne part pas dans le journal
+	// si la sortie d'erreur est redirigée vers un fichier.
+	fmt.Printf("\n  Mot de passe : %s   (nom d'utilisateur : n'importe lequel)\n\n", password)
+	log.Print("sans HTTPS, ce mot de passe circule en clair sur le Wi-Fi : à utiliser chez toi, pas sur un Wi-Fi public")
 }

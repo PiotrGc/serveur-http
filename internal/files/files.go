@@ -160,6 +160,13 @@ func serveFile(f *os.File, info fs.FileInfo, req *http1.Request) *http1.Response
 		"Accept-Ranges": "bytes",
 		"Last-Modified": lastModified,
 	}
+	if base, _, _ := strings.Cut(headers["Content-Type"], ";"); base == "text/html" || base == "image/svg+xml" {
+		// Un .html ou un .svg du dossier partagé peut contenir du JavaScript. Ouvert depuis le téléphone,
+		// ce script tournerait avec l'accès à tous les fichiers partagés (le navigateur a déjà le mot de
+		// passe) et pourrait les envoyer ailleurs. « sandbox » interdit les scripts dans ces pages.
+		// Pas sur les PDF : le lecteur PDF des navigateurs ne marche plus dans une page « sandbox ».
+		headers["Content-Security-Policy"] = "sandbox"
+	}
 	compressible := isCompressible(headers["Content-Type"])
 	if compressible {
 		// Vary : la réponse change selon Accept-Encoding (gzip ou non). Sans cet en-tête, un cache
