@@ -1,11 +1,11 @@
 // Écriture des réponses HTTP/1.1 : ligne de statut, en-têtes, ligne vide, corps.
 // Utilisé par : internal/server, pour répondre à chaque requête (y compris les erreurs du parser).
-// Ne gère pas encore le keep-alive (V0.4) ni le chunked (V0.6) : chaque réponse a un
-// Content-Length et se termine par la fermeture de la connexion.
+// Le corps part soit avec un Content-Length, soit compressé en gzip et découpé en chunked (V0.6).
 package http1
 
 import (
 	"bufio"
+	"compress/gzip"
 	"errors"
 	"fmt"
 	"io"
@@ -43,6 +43,9 @@ type Response struct {
 	// KeepAlive : le serveur garde la connexion ouverte après cette réponse (« Connection: keep-alive »).
 	// false par défaut : « Connection: close ». C'est le serveur qui le décide, pas le handler.
 	KeepAlive bool
+	// Compress : le corps part compressé en gzip, en chunked (pas de Content-Length).
+	// Le handler ne le met que si le client accepte gzip ET parle HTTP/1.1 (chunked n'existe pas en 1.0).
+	Compress bool
 }
 
 // statusText : le texte standard de chaque code utilisé (RFC 9110 §15, RFC 6585 §5 pour 431).
@@ -71,7 +74,8 @@ func StatusText(code int) string {
 
 // autoHeaders : les en-têtes que WriteResponse calcule lui-même. S'ils sont dans resp.Headers,
 // ils sont ignorés : un Content-Length faux ferait lire au client trop ou trop peu d'octets.
-var autoHeaders = map[string]bool{"content-length": true, "date": true, "server": true, "connection": true}
+// Transfer-Encoding aussi : c'est lui qui dit où finit le corps, il ne doit venir que de nous.
+var autoHeaders = map[string]bool{"content-length": true, "date": true, "server": true, "connection": true, "transfer-encoding": true}
 
 // WriteResponse écrit resp en entier dans w.
 // now sert à l'en-tête Date. On le passe en paramètre au lieu d'appeler time.Now() ici,
@@ -98,6 +102,14 @@ func WriteResponse(w io.Writer, resp *Response, now time.Time) error {
 	noBody := resp.Status == 304
 	if noBody {
 		delete(headers, "Content-Length")
+	}
+	// gzip : la taille compressée n'est connue qu'à la fin, donc pas de Content-Length mais du
+	// chunked, qui marque lui-même la fin du corps (RFC 9112 §6.1). Les deux ensemble sont interdits.
+	compress := resp.Compress && !noBody
+	if compress {
+		delete(headers, "Content-Length")
+		headers["Content-Encoding"] = "gzip"
+		headers["Transfer-Encoding"] = "chunked"
 	}
 	for name, value := range resp.Headers {
 		if autoHeaders[strings.ToLower(name)] {
@@ -135,6 +147,10 @@ func WriteResponse(w io.Writer, resp *Response, now time.Time) error {
 	switch {
 	case resp.OmitBody || noBody:
 		// HEAD ou 304 : rien après la ligne vide.
+	case compress:
+		if err := writeGzipChunked(bw, resp); err != nil {
+			return err
+		}
 	case resp.File != nil:
 		// io.CopyN copie exactement Size octets par morceaux (32 Kio à la fois), sans tout charger.
 		// Si le fichier a moins d'octets que prévu, CopyN rend io.EOF : on remonte l'erreur pour que
@@ -147,6 +163,31 @@ func WriteResponse(w io.Writer, resp *Response, now time.Time) error {
 	}
 	// Les erreurs des WriteString précédents sont gardées par le bufio.Writer et rendues ici.
 	return bw.Flush()
+}
+
+// writeGzipChunked écrit le corps compressé, en chunked : les octets passent par trois étapes,
+// source → gzip (compression) → chunkedWriter (découpage) → bw (tampon de la socket).
+// Rien n'est chargé en entier : un fichier texte de 1 Go se compresse au fil de l'eau.
+func writeGzipChunked(bw *bufio.Writer, resp *Response) error {
+	zw := gzip.NewWriter(chunkedWriter{w: bw})
+	var err error
+	if resp.File != nil {
+		_, err = io.CopyN(zw, resp.File, resp.Size)
+	} else {
+		_, err = zw.Write(resp.Body)
+	}
+	if err != nil {
+		return err
+	}
+	// Close vide le tampon de gzip et écrit sa fin (somme de contrôle CRC-32 et taille d'origine).
+	// Sans lui, le client recevrait un gzip tronqué.
+	if err := zw.Close(); err != nil {
+		return err
+	}
+	// Le morceau vide final : « 0 », ligne vide. Il dit au client que le corps est fini, et donc
+	// où commence la réponse suivante sur une connexion keep-alive.
+	_, err = bw.WriteString("0\r\n\r\n")
+	return err
 }
 
 // ErrorResponse fabrique une réponse d'erreur en texte brut, par ex. « 404 Not Found ».

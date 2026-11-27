@@ -160,6 +160,12 @@ func serveFile(f *os.File, info fs.FileInfo, req *http1.Request) *http1.Response
 		"Accept-Ranges": "bytes",
 		"Last-Modified": lastModified,
 	}
+	compressible := isCompressible(headers["Content-Type"])
+	if compressible {
+		// Vary : la réponse change selon Accept-Encoding (gzip ou non). Sans cet en-tête, un cache
+		// pourrait servir la version gzip à un client qui ne sait pas la lire.
+		headers["Vary"] = "Accept-Encoding"
+	}
 
 	// If-Modified-Since (RFC 9110 §13.1.3) : le navigateur a une copie datée ; si le fichier n'a pas
 	// changé depuis, on répond 304 sans corps, et il réutilise sa copie. Une date illisible est ignorée.
@@ -201,7 +207,28 @@ func serveFile(f *os.File, info fs.FileInfo, req *http1.Request) *http1.Response
 		}
 	}
 
-	return &http1.Response{Status: 200, Headers: headers, File: f, Size: size}
+	// Le fichier entier : compressé si c'est du texte et si le client sait le lire.
+	// (Un morceau 206 ne l'est jamais : ses positions désignent des octets du fichier original.)
+	return &http1.Response{Status: 200, Headers: headers, File: f, Size: size, Compress: compressible && wantsGzip(req)}
+}
+
+// compressibleTypes : les types qui gagnent à être compressés (du texte). Les PDF, images, vidéos
+// et zip sont déjà compressés : gzip ne gagnerait rien et coûterait du processeur.
+var compressibleTypes = map[string]bool{
+	"text/html": true, "text/plain": true, "text/css": true, "text/javascript": true,
+	"application/json": true, "image/svg+xml": true,
+}
+
+// isCompressible dit si un Content-Type vaut la peine d'être compressé (« text/html; charset=utf-8 » → text/html).
+func isCompressible(contentType string) bool {
+	base, _, _ := strings.Cut(contentType, ";")
+	return compressibleTypes[base]
+}
+
+// wantsGzip : le client accepte gzip ET parle HTTP/1.1. En HTTP/1.0, le chunked n'existe pas,
+// et sans lui on ne peut pas envoyer un corps dont on ne connaît pas la taille à l'avance.
+func wantsGzip(req *http1.Request) bool {
+	return req.Proto == "HTTP/1.1" && http1.AcceptsGzip(req.Headers["accept-encoding"])
 }
 
 // serveDir sert index.html s'il existe dans le dossier, sinon la page de listing.
@@ -234,8 +261,10 @@ func serveDir(root *os.Root, dir *os.File, urlPath, rel string, req *http1.Reque
 			"Content-Type":            "text/html; charset=utf-8",
 			"X-Content-Type-Options":  "nosniff",
 			"Content-Security-Policy": cspHeader,
+			"Vary":                    "Accept-Encoding",
 		},
-		Body: renderListing(urlPath, entries),
+		Body:     renderListing(urlPath, entries),
+		Compress: wantsGzip(req),
 	}
 }
 
