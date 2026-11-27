@@ -154,6 +154,15 @@ func parseRequestLine(line string) (*Request, error) {
 	} else if !strings.HasPrefix(target, "/") {
 		return nil, errBadRequest("la cible doit commencer par /")
 	}
+	// RFC 3986 : une URI ne contient que de l'ASCII visible (0x21 à 0x7e). Les accents et les espaces
+	// arrivent encodés (%C3%A9, %20) : un navigateur le fait toujours. On refuse donc les caractères de
+	// contrôle (dont \x1b, qui commence les séquences d'échappement d'un terminal et pourrait falsifier
+	// le journal), DEL et les octets non ASCII bruts.
+	for i := 0; i < len(target); i++ {
+		if target[i] < 0x21 || target[i] > 0x7e {
+			return nil, errBadRequest("caractère interdit dans la cible")
+		}
+	}
 
 	if err := checkVersion(proto); err != nil {
 		return nil, err

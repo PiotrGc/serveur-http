@@ -89,6 +89,13 @@ func TestParseRequestRefus(t *testing.T) {
 		{"deux espaces entre les parties", "GET  / HTTP/1.1\r\nHost: a\r\n\r\n", 400},
 		{"cible qui ne commence pas par /", "GET cours HTTP/1.1\r\nHost: a\r\n\r\n", 400},
 		{"* hors OPTIONS", "GET * HTTP/1.1\r\nHost: a\r\n\r\n", 400},
+		// La cible ne contient que de l'ASCII visible (RFC 3986). Sans ce contrôle, \x1b (début d'une
+		// séquence d'échappement de terminal) arriverait jusqu'au journal et pourrait le falsifier.
+		{"échappement de terminal dans la cible", "GET /\x1b[2Jfaux HTTP/1.1\r\nHost: a\r\n\r\n", 400},
+		{"octet nul dans la cible", "GET /a\x00b HTTP/1.1\r\nHost: a\r\n\r\n", 400},
+		{"tabulation dans la cible", "GET /a\tb HTTP/1.1\r\nHost: a\r\n\r\n", 400},
+		{"DEL dans la cible", "GET /a\x7fb HTTP/1.1\r\nHost: a\r\n\r\n", 400},
+		{"octet non ASCII brut dans la cible", "GET /r\xc3\xa9seau HTTP/1.1\r\nHost: a\r\n\r\n", 400},
 		{"méthode avec un caractère interdit", "GE(T / HTTP/1.1\r\nHost: a\r\n\r\n", 400},
 		{"méthode inconnue", "BREW / HTTP/1.1\r\nHost: a\r\n\r\n", 501},
 		{"méthode en minuscules (sensible à la casse)", "get / HTTP/1.1\r\nHost: a\r\n\r\n", 501},
