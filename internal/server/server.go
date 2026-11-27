@@ -29,6 +29,7 @@ const (
 	DefaultIdleTimeout  = 30 * time.Second // attente de la requête suivante sur une connexion keep-alive
 	DefaultMaxRequests  = 100              // requêtes par connexion, avant de la fermer
 	DefaultMaxPerIP     = 10               // connexions simultanées par IP (un navigateur en ouvre jusqu'à 6)
+	DefaultMaxRejects   = 32               // réponses 503 en cours d'envoi au même moment
 	DefaultMinRate      = 1 << 10          // 1 Kio/s : débit minimum d'une réponse
 	DefaultRateWindow   = 30 * time.Second // fenêtre sur laquelle le débit minimum est mesuré
 
@@ -58,6 +59,8 @@ type Server struct {
 	// MaxConnsPerIP : nombre maximum de connexions simultanées venant d'une même IP. Au-delà, 503.
 	// Sans cette limite, une seule machine pourrait prendre toutes les places de MaxConns.
 	MaxConnsPerIP int
+	// MaxRejects : nombre maximum de réponses 503 en cours d'envoi. Au-delà, fermeture immédiate.
+	MaxRejects int
 	// MinRate (octets par seconde) et RateWindow : une réponse dont le débit reste sous MinRate
 	// pendant toute une fenêtre RateWindow est coupée. C'est la parade au client qui lit 1 octet de
 	// temps en temps pour garder sa place indéfiniment (« slow read »).
@@ -106,6 +109,10 @@ func (s *Server) Serve(ln net.Listener) error {
 	// Sémaphore : un channel avec une capacité de MaxConns. Prendre une place = y envoyer une valeur,
 	// rendre une place = en retirer une.
 	sem := make(chan struct{}, valeur(s.MaxConns, DefaultMaxConns))
+	// Les refus (503) ont leur propre limite : sans elle, un flot de connexions lancerait autant de
+	// goroutines de refus (chacune vit jusqu'à 2 s), et les sockets du PC s'épuiseraient.
+	rejectSem := make(chan struct{}, valeur(s.MaxRejects, DefaultMaxRejects))
+	var backoff time.Duration
 	for {
 		// Accept attend (bloque) jusqu'à ce qu'un client se connecte.
 		conn, err := ln.Accept()
@@ -114,8 +121,15 @@ func (s *Server) Serve(ln net.Listener) error {
 			if errors.Is(err, net.ErrClosed) {
 				return nil
 			}
-			return err
+			// Autre erreur (ex. plus de descripteurs de fichiers libres, « EMFILE ») : souvent passagère.
+			// On attend un peu, de plus en plus longtemps (5 ms, 10 ms… jusqu'à 1 s), puis on réessaie,
+			// au lieu d'arrêter tout le serveur. C'est ce que fait net/http.
+			backoff = min(max(2*backoff, 5*time.Millisecond), time.Second)
+			s.logf("Accept : %v ; nouvel essai dans %v", err, backoff)
+			time.Sleep(backoff)
+			continue
 		}
+		backoff = 0
 		ip := hostOf(conn)
 
 		// select avec default : on essaie de prendre une place SANS attendre. Si tout est plein, on
@@ -138,10 +152,21 @@ func (s *Server) Serve(ln net.Listener) error {
 			if !full {
 				<-sem // la place prise n'est pas utilisée : la limite par IP est atteinte
 			}
-			go func() {
-				defer s.untrack(conn, ip, false)
-				s.reject(conn, ip)
-			}()
+			select {
+			case rejectSem <- struct{}{}:
+				go func() {
+					defer func() {
+						s.untrack(conn, ip, false)
+						<-rejectSem
+					}()
+					s.reject(conn, ip)
+				}()
+			default:
+				// Trop de refus déjà en cours : on ferme tout de suite, sans répondre. C'est brutal,
+				// mais ça ne coûte rien, et un client normal ne tombe pas dans ce cas.
+				conn.Close()
+				s.untrack(conn, ip, false)
+			}
 		case trackOK:
 			// go : handleConn tourne en parallèle, et la boucle retourne tout de suite à Accept.
 			// C'est ce qui permet de servir 200 clients en même temps.

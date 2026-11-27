@@ -2,10 +2,12 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -180,5 +182,59 @@ func TestIPDuClient(t *testing.T) {
 	echanger(t, addr, requeteGET)
 	if ip := <-ipVue; ip != "127.0.0.1" {
 		t.Fatalf("RemoteAddr = %q, attendu 127.0.0.1 (sans le port)", ip)
+	}
+}
+
+// TestRefusLimites : les refus (503) ont eux aussi une limite. Quand MaxRejects refus sont déjà en
+// cours, la connexion suivante est fermée tout de suite, sans réponse. Sinon, un flot de connexions
+// lancerait autant de goroutines de refus, qui vivent chacune jusqu'à 2 s : les sockets du PC s'épuiseraient.
+func TestRefusLimites(t *testing.T) {
+	libere := make(chan struct{})
+	defer close(libere)
+	addr := lancer(t, &Server{Handler: bloquant(libere), MaxConns: 1, MaxConnsPerIP: 10, MaxRejects: 1})
+
+	a := dialDepuis(t, "127.0.0.1", addr) // occupe la seule place
+	defer a.Close()
+	go envoyer(a, 5*time.Second)
+	time.Sleep(100 * time.Millisecond)
+
+	b := dialDepuis(t, "127.0.0.1", addr) // refusé : 503, puis le serveur attend ~1 s (lingering close)
+	defer b.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	c := dialDepuis(t, "127.0.0.1", addr) // plus de place pour un refus : fermeture immédiate, sans 503
+	defer c.Close()
+	debut := time.Now()
+	if rep := envoyer(c, 2*time.Second); rep != "" || time.Since(debut) > 500*time.Millisecond {
+		t.Fatalf("3e connexion : %q après %v, attendu une fermeture immédiate sans réponse", rep, time.Since(debut))
+	}
+}
+
+// listenerQuiEchoue : un listener dont le premier Accept échoue, comme quand le système n'a plus de
+// descripteurs de fichiers (EMFILE). Les Accept suivants marchent normalement.
+type listenerQuiEchoue struct {
+	net.Listener
+	echecs atomic.Int32
+}
+
+func (l *listenerQuiEchoue) Accept() (net.Conn, error) {
+	if l.echecs.Add(1) == 1 {
+		return nil, errors.New("accept : trop de fichiers ouverts (simulé)")
+	}
+	return l.Listener.Accept()
+}
+
+// TestAcceptQuiEchoueUneFois : une erreur passagère d'Accept ne doit pas arrêter le serveur.
+// Il attend un peu, puis réessaie.
+func TestAcceptQuiEchoueUneFois(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{Handler: Hello, Logf: func(string, ...any) {}}
+	go srv.Serve(&listenerQuiEchoue{Listener: ln})
+	defer ln.Close()
+	if rep := echanger(t, ln.Addr().String(), requeteGET); !strings.HasPrefix(rep, "HTTP/1.1 200 OK") {
+		t.Fatalf("le serveur s'est arrêté après une erreur d'Accept : %q", rep)
 	}
 }
