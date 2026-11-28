@@ -12,7 +12,7 @@ Son usage : partager un dossier en lecture seule sur le Wi-Fi pour lire ses PDF 
 - [x] **V0.4** : keep-alive (RFC 9112 §9.3) avec pipelining, délai d'inactivité, 100 requêtes par connexion au maximum, corps de requête sauté, refus du request smuggling (Content-Length + Transfer-Encoding)
 - [x] **V0.5** : requêtes Range (206, 416, If-Range), Last-Modified et 304, Accept-Ranges. Un fichier de 2 Go est servi avec 10 Mo de mémoire
 - [x] **V0.6** : compression gzip au fil de l'eau (texte et listing seulement, `Accept-Encoding` avec poids q, `Vary`) et `Transfer-Encoding: chunked` écrit à la main. Un cours de 1,18 Mo arrive en 53 Ko
-- [ ] V0.7 : accès Wi-Fi avec mot de passe
+- [x] **V0.7** : accès Wi-Fi (`-lan`) avec un mot de passe aléatoire par lancement (Basic Auth, comparaison en temps constant, blocage en 429 après 10 échecs), limite par IP, 503 immédiate quand c'est plein, débit minimum. Testé sur un vrai téléphone
 - [ ] V1.0 : benchmark et release
 
 ## Lancer
